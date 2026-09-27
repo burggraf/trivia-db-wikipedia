@@ -24,6 +24,42 @@ Useful local check:
 sqlite3 data/wikipedia.sqlite 'SELECT page_id, title, wikidata_qid, abstract FROM articles LIMIT 5;'
 ```
 
+## Trivia article shortlist
+
+Create a deterministic, editable candidate manifest from the top 10,000 articles by ten-year U.S. popularity:
+
+```sh
+python3 select_trivia_articles.py
+```
+
+This opens `data/wikipedia.sqlite` read-only and writes `data/trivia_candidates.csv`. The report includes rank, popularity, article/source metadata, abstract word count, review flags, and an initial question-count ceiling. The ceiling is not a quota; shorter abstracts are flagged for review. Article-level category guesses are intentionally omitted because a single article can support questions in different categories.
+
+To create a smaller test manifest or choose a different output path:
+
+```sh
+python3 select_trivia_articles.py --limit 100 --output /tmp/trivia-candidates.csv
+```
+
+Edit `include_in_pilot` to `1` for manually selected pilot articles and use `review_notes` for selection context. The `question_count_override` column is informational only: the current generator creates at most one question per `page_id`. Existing manifests are never overwritten by default. Use `--force` only when you intend to replace the output.
+
+## Resumable trivia question generation
+
+The generator uses the edited candidate manifest as its source snapshot. It does **not** write to `data/wikipedia.sqlite`. It creates a separate `data/trivia.sqlite` containing article jobs, validated draft questions, and every completed generation attempt (prompt, raw reply, status, token counts, API-equivalent cost). Prior hand-written pilot JSONL drafts are **not** automatically imported or counted as completed jobs.
+
+```sh
+python3 generate_trivia.py                                  # attempt one selected pilot article
+python3 generate_trivia.py --limit 20                       # next 20, with 8 workers by default
+python3 generate_trivia.py --all --limit 100 --workers 8     # continue through all 10,000 ranked candidates
+python3 generate_trivia.py --all --retry-failed --limit 10
+```
+
+Each worker starts a fresh authenticated Pi run using `openai-codex/gpt-6-luna` with `minimal` reasoning, no tools or session. The default is eight concurrent workers; use `--workers N` to lower or raise that bounded limit. Higher values can trigger provider rate limits and do not necessarily improve throughput. Workers atomically write results to `data/trivia.sqlite.spool` (override with `--spool-dir`); the parent is the only SQLite writer, imports these files before new work on restart, and deletes each only after its transaction commits. Run `pi auth check --provider openai-codex --model gpt-6-luna` first if needed. Accepted items are **drafts**, not publication-ready questions: source evidence, answer-in-stem, schema, and some orphaned-reference patterns are checked automatically, but factual support, distractors, standalone clarity, sensitivity, and fun facts still need human review. A model may return a skip reason instead of a weak question. Failed attempts are held for `--retry-failed`; interrupted `running` jobs are automatically retried on restart. Repeated commands skip completed and skipped articles, preserving stable question IDs. Each invocation attempts at most `--limit` articles (default 1). Avoid changing the manifest source snapshot between runs; existing jobs keep their original source text and revision.
+
+```sh
+sqlite3 data/trivia.sqlite 'SELECT status, COUNT(*) FROM article_jobs GROUP BY status;'
+sqlite3 data/trivia.sqlite 'SELECT page_id, question, a FROM questions LIMIT 5;'
+```
+
 ## U.S. popularity
 
 ```sh
