@@ -27,6 +27,38 @@ class PipelineTests(unittest.TestCase):
                     metadata=dict(fact_tested='City of founding', evidence=f'{row["title"]} was founded in Paris.',
                                   explanation='The source names Paris.'), funfact=None)
 
+    def test_targeted_prompt_keeps_all_categories_and_requests_honest_target(self):
+        prompt = g.make_prompt(self.rows[0], target_category='food_drink')
+        self.assertIn(json.dumps(g.CATEGORIES), prompt)
+        self.assertIn('Requested target category: food_drink', prompt)
+        self.assertIn('skip_reason', prompt)
+        self.assertIn('fact being tested', prompt)
+        item = self.response(self.rows[0])
+        self.assertEqual(g.validate(item, self.rows[0])['category'], 'geography')
+
+    def test_uniqueness_review_accepts_only_one_match_that_maps_to_a(self):
+        mapping = {'A': 'b', 'B': 'a', 'C': 'c', 'D': 'd'}
+        unique = g.parse_uniqueness_review(
+            json.dumps({'matching_choices': ['B'], 'confident': True, 'reason': 'Only B fits.'}), mapping)
+        self.assertTrue(unique['accepted'])
+        multiple = g.parse_uniqueness_review(
+            json.dumps({'matching_choices': ['A', 'B', 'C'], 'confident': True, 'reason': 'Several fit.'}), mapping)
+        self.assertFalse(multiple['accepted'])
+        wrong = g.parse_uniqueness_review(
+            json.dumps({'matching_choices': ['A'], 'confident': True, 'reason': 'Only A fits.'}), mapping)
+        self.assertFalse(wrong['accepted'])
+        uncertain = g.parse_uniqueness_review(
+            json.dumps({'matching_choices': ['B'], 'confident': False, 'reason': 'Not sure.'}), mapping)
+        self.assertFalse(uncertain['accepted'])
+
+    def test_review_prompt_hides_intended_answer_and_category(self):
+        item = self.response(self.rows[0])
+        prompt, mapping = g.make_uniqueness_review_prompt(self.rows[0], item)
+        self.assertIn(item['question'], prompt)
+        self.assertNotIn(item['metadata']['fact_tested'], prompt)
+        self.assertNotIn(item['category'], prompt)
+        self.assertEqual(set(mapping.values()), set('abcd'))
+
     def test_prompt_includes_honest_nine_level_rubric_without_quotas(self):
         prompt = g.make_prompt(self.rows[0])
         for marker in (
@@ -35,6 +67,7 @@ class PipelineTests(unittest.TestCase):
             '8: Very hard', '9: Extremely hard',
             'Rate the complete multiple-choice question',
             'do not force an equal distribution',
+            'any distinctive part of it',
         ):
             self.assertIn(marker, prompt)
 
@@ -43,6 +76,43 @@ class PipelineTests(unittest.TestCase):
             g.run_batch(self.conn, [self.rows[0], self.rows[0]], lambda _: self.fail('must not dispatch'),
                         limit=2, workers=2, spool_dir=Path(self.tmp.name) / 'spool')
         self.assertEqual(self.conn.execute('select count(*) from article_jobs').fetchone()[0], 0)
+
+    def test_rejected_uniqueness_review_skips_and_is_persisted(self):
+        g.claim_job(self.conn, self.rows[0], retry_failed=False)
+        spool = Path(self.tmp.name) / 'spool'
+        result = dict(id='ambiguous-review', page_id=1, source_revision_id=11, prompt='test',
+                      raw_response=json.dumps(self.response(self.rows[0])),
+                      quality_review=dict(accepted=False, matching_choices=['A', 'B'], reason='Both fit.', raw_response='review'),
+                      usage=dict(input=3, output=4), error=None)
+        g.write_spool_result(spool, result)
+        self.assertEqual(g.ingest_spool(self.conn, spool), (0, 1, 0))
+        self.assertEqual(self.conn.execute('select count(*) from questions').fetchone()[0], 0)
+        self.assertEqual(self.conn.execute("select status from article_jobs where page_id=1").fetchone()[0], 'skipped')
+        review = self.conn.execute('select quality_review from generation_attempts').fetchone()[0]
+        self.assertIn('Both fit', review)
+
+    def test_pi_generate_runs_blind_choice_review(self):
+        response = json.dumps(self.response(self.rows[0]))
+        calls = []
+        def fake_run(cmd, *, input, **kwargs):
+            calls.append(input)
+            if len(calls) == 1:
+                text, usage = response, {'input': 5, 'output': 2, 'cacheRead': 1}
+            else:
+                choices = [line for line in input.splitlines() if line[:1] in 'ABCD' and line[1:3] == '. ']
+                correct = next(line[0] for line in choices if line[3:] == 'Paris')
+                text = json.dumps({'matching_choices': [correct], 'confident': True, 'reason': 'Only this choice fits.'})
+                usage = {'input': 4, 'output': 1, 'cacheRead': 0}
+            event = {'type': 'message_end', 'message': {'role': 'assistant', 'stopReason': 'stop',
+                     'content': [{'type': 'text', 'text': text}], 'usage': usage}}
+            return type('Result', (), {'stdout': json.dumps(event) + chr(10), 'stderr': '', 'returncode': 0})()
+        with patch.object(g.subprocess, 'run', side_effect=fake_run):
+            raw, usage = g.pi_generate(self.rows[0])
+        self.assertEqual(raw, response)
+        self.assertEqual(len(calls), 2)
+        self.assertNotIn('fact_tested', calls[1])
+        self.assertTrue(usage['quality_review']['accepted'])
+        self.assertEqual(usage['input'], 9)
 
     def test_ingests_spool_before_dispatch(self):
         g.claim_job(self.conn, self.rows[0], retry_failed=False)
@@ -175,6 +245,38 @@ class PipelineTests(unittest.TestCase):
         item = self.response(self.rows[0])
         item['a'], item['question'] = 'US', 'Which house was completed in 1900?'
         g.validate(item, self.rows[0])
+        item = self.response(self.rows[0])
+        item['a'], item['question'] = 'Bank of America', 'Which bank merged into JPMorgan in 2000?'
+        g.validate(item, self.rows[0])
+
+    def test_rejects_distinctive_answer_component_leaks(self):
+        article = dict(self.rows[0], abstract=(
+            'JPMorgan Chase was created in 2000 by the merger of New York City banks '
+            'J.P. Morgan & Co. and Chase Manhattan Company.'))
+        item = self.response(self.rows[0])
+        item.update(category='business_economics', subcategory='Banking history', level=5,
+                    question='Which two New York City banks merged in 2000 to create JPMorgan Chase?',
+                    a='J.P. Morgan & Co. and Chase Manhattan Company',
+                    b='Citicorp and Bank of America', c='Wells Fargo and Chemical Bank',
+                    d='First National City Bank and Manufacturers Hanover')
+        item['metadata'].update(
+            fact_tested='JPMorgan Chase was created by the merger of J.P. Morgan and Chase Manhattan.',
+            evidence=article['abstract'], explanation='The source names both banks.')
+        with self.assertRaisesRegex(ValueError, 'leaks'):
+            g.validate(item, article)
+
+    def test_shared_topic_words_are_not_mistaken_for_answer_leaks(self):
+        cases = (
+            ('The Thirteenth Amendment', 'Which amendment abolished slavery?'),
+            ('Sunni Islam', 'Which branch of Islam is practiced by most people?'),
+            ('The 1953 ceremony', 'Which Academy Awards ceremony was first televised?'),
+            ('The Atlantic Ocean', 'Which ocean borders the coast?'),
+        )
+        for answer, stem in cases:
+            item = self.response(self.rows[0])
+            item['a'], item['question'] = answer, stem
+            with self.subTest(answer=answer):
+                g.validate(item, self.rows[0])
 
     def test_reject_hidden_article_references(self):
         item = self.response(self.rows[0])

@@ -53,12 +53,24 @@ python3 generate_trivia.py --all --limit 100 --workers 8     # continue through 
 python3 generate_trivia.py --all --retry-failed --limit 10
 ```
 
-Each worker starts a fresh authenticated Pi run using `openai-codex/gpt-6-luna` with `minimal` reasoning, no tools or session. The default is eight concurrent workers; use `--workers N` to lower or raise that bounded limit. Higher values can trigger provider rate limits and do not necessarily improve throughput. Workers atomically write results to `data/trivia.sqlite.spool` (override with `--spool-dir`); the parent is the only SQLite writer, imports these files before new work on restart, and deletes each only after its transaction commits. Run `pi auth check --provider openai-codex --model gpt-6-luna` first if needed. Accepted items are **drafts**, not publication-ready questions: source evidence, answer-in-stem, schema, and some orphaned-reference patterns are checked automatically, but factual support, distractors, standalone clarity, sensitivity, and fun facts still need human review. A model may return a skip reason instead of a weak question. Failed attempts are held for `--retry-failed`; interrupted `running` jobs are automatically retried on restart. Repeated commands skip completed and skipped articles, preserving stable question IDs. Each invocation attempts at most `--limit` articles (default 1). Avoid changing the manifest source snapshot between runs; existing jobs keep their original source text and revision.
+Each worker starts fresh authenticated Pi runs using `openai-codex/gpt-6-luna` with `minimal` reasoning, no tools or session. A second, answer-blind Luna review checks that exactly one choice fits the stem; ambiguous or uncertain drafts are skipped. This adds one model call per otherwise-valid question. The default is eight concurrent workers; use `--workers N` to lower or raise that bounded limit. Higher values can trigger provider rate limits and do not necessarily improve throughput. Workers atomically write results to `data/trivia.sqlite.spool` (override with `--spool-dir`); the parent is the only SQLite writer, imports these files before new work on restart, and deletes each only after its transaction commits. Run `pi auth check --provider openai-codex --model gpt-6-luna` first if needed. Accepted items are **drafts**, not publication-ready questions: source evidence, answer-in-stem, schema, and some orphaned-reference patterns are checked automatically, but factual support, distractors, standalone clarity, sensitivity, and fun facts still need human review. A model may return a skip reason instead of a weak question. Failed attempts are held for `--retry-failed`; interrupted `running` jobs are automatically retried on restart. Repeated commands skip completed and skipped articles, preserving stable question IDs. Each invocation attempts at most `--limit` articles (default 1). Avoid changing the manifest source snapshot between runs; existing jobs keep their original source text and revision.
 
 ```sh
 sqlite3 data/trivia.sqlite 'SELECT status, COUNT(*) FROM article_jobs GROUP BY status;'
 sqlite3 data/trivia.sqlite 'SELECT page_id, question, a FROM questions LIMIT 5;'
 ```
+
+## Targeted category generation
+
+Standard generation remains strictly popularity-ordered. The optional targeted generator helps fill underrepresented categories without consuming pages that do not fit: it cheaply prefilters unprocessed abstracts using title/description/abstract keyword hints, then asks GPT-6 Luna to choose honestly from all 15 categories based on the fact being tested. Targeted mode accepts the question only if Luna's chosen category matches the requested target; mismatches become targeted misses, and those pages stay available to standard generation. This is a prompt-based safeguard, not a semantic guarantee; generated drafts still need human review.
+
+```sh
+python3 generate_targeted_trivia.py \
+  --categories food_drink,games_hobbies,arts_design,religion_philosophy \
+  --per-category 25 --workers 8
+```
+
+`--per-category` is the number of newly accepted targeted questions to add per category in that invocation. Categories run sequentially, and durable results go to `data/trivia.sqlite.targeted.spool`. The keyword hints only reduce wasted calls; they do not assign a question category. The prompt asks the model to classify the fact itself, not incidental terms in the article, and to skip if the requested target does not fit. All 15 labels remain available; a result whose chosen label differs from the target is recorded as a miss instead of being saved under the wrong category. Targeted questions also pass the separate, answer-blind uniqueness review before insertion.
 
 ## U.S. popularity
 
